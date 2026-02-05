@@ -1,6 +1,5 @@
 package com.yuyuan.literature.controller;
 
-import cn.hutool.core.util.StrUtil;
 import com.yuyuan.literature.common.request.PageResult;
 import com.yuyuan.literature.common.result.Result;
 import com.yuyuan.literature.dto.BatchLiteratureImportRequest;
@@ -51,16 +50,14 @@ public class LiteratureController {
      * 生成文献阅读指南
      *
      * @param file   上传的文献文件
-     * @param apiKey Kimi AI API Key
+     * @param apiKey Ali API Key
      * @return SSE 流式响应
      */
     @PostMapping(value = "/generate-guide", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
     @Operation(summary = "生成文献阅读指南", description = "上传文献文件，AI 生成阅读指南（SSE 流式响应）")
     public SseEmitter generateReadingGuide(
-            @Parameter(description = "文献文件（支持 PDF、Word、Markdown）", required = true)
-            @RequestParam("file") MultipartFile file,
-            @Parameter(description = "Kimi AI API Key", required = true)
-            @RequestParam("apiKey") @NotBlank(message = "API Key 不能为空") String apiKey) {
+            @Parameter(description = "文献文件（支持 PDF、Word、Markdown）", required = true) @RequestParam("file") MultipartFile file,
+            @Parameter(description = "Ali API Key", required = true) @RequestParam("apiKey") @NotBlank(message = "API Key 不能为空") String apiKey) {
 
         log.info("开始生成文献阅读指南，文件名: {}, 文件大小: {} bytes",
                 file.getOriginalFilename(), file.getSize());
@@ -99,22 +96,19 @@ public class LiteratureController {
                     .name("progress")
                     .data("内容解析成功，开始生成阅读指南..."));
 
-            // 创建内容收集器
-            StringBuilder readingGuideBuilder = new StringBuilder();
-
-            // 异步生成阅读指南（带内容收集）
-            literatureAiService.generateReadingGuideStream(apiKey, fileContent, sseEmitter, readingGuideBuilder);
+            // 异步生成阅读指南（流式写库）
+            literatureAiService.generateReadingGuideStream(apiKey, fileContent, sseEmitter, literatureId,
+                    literatureService);
 
             // 设置 SSE 完成回调，在阅读指南完成后启动分类
-            final String finalFilePath = filePath;
             final Long finalLiteratureId = literatureId;
 
             sseEmitter.onCompletion(() -> {
                 log.info("阅读指南生成完成，开始后台分类处理");
 
-                // 保存阅读指南到数据库
-                String readingGuide = readingGuideBuilder.toString();
-                if (StrUtil.isNotBlank(readingGuide)) {
+                // 从数据库获取完整阅读指南
+                String readingGuide = literatureService.getById(finalLiteratureId).getReadingGuide();
+                if (readingGuide != null && !readingGuide.trim().isEmpty()) {
                     literatureService.updateReadingGuide(finalLiteratureId, readingGuide);
 
                     // 使用虚拟线程进行后台分类
@@ -159,7 +153,6 @@ public class LiteratureController {
         return sseEmitter;
     }
 
-
     /**
      * 分页查询文献
      */
@@ -180,8 +173,7 @@ public class LiteratureController {
     @GetMapping("/{id}")
     @Operation(summary = "获取文献详情", description = "根据ID获取文献完整信息")
     public Result<LiteratureVO> getLiteratureDetail(
-            @Parameter(description = "文献ID", required = true)
-            @PathVariable @NotNull(message = "文献ID不能为空") Long id) {
+            @Parameter(description = "文献ID", required = true) @PathVariable @NotNull(message = "文献ID不能为空") Long id) {
 
         log.info("获取文献详情，ID: {}", id);
 
@@ -195,8 +187,7 @@ public class LiteratureController {
     @GetMapping("/{id}/download")
     @Operation(summary = "下载文献文件", description = "根据文献ID下载对应的原始文件")
     public void downloadLiteratureFile(
-            @Parameter(description = "文献ID", required = true)
-            @PathVariable @NotNull(message = "文献ID不能为空") Long id,
+            @Parameter(description = "文献ID", required = true) @PathVariable @NotNull(message = "文献ID不能为空") Long id,
             jakarta.servlet.http.HttpServletResponse response) {
 
         log.info("下载文献文件，ID: {}", id);
@@ -209,10 +200,8 @@ public class LiteratureController {
     @PostMapping(value = "/batch-import", consumes = MediaType.MULTIPART_FORM_DATA_VALUE, produces = MediaType.TEXT_EVENT_STREAM_VALUE)
     @Operation(summary = "批量导入文献", description = "批量上传文献文件，AI生成阅读指南并实时返回处理状态")
     public SseEmitter batchImportLiterature(
-            @Parameter(description = "文献文件列表", required = true)
-            @RequestPart("files") List<MultipartFile> files,
-            @Parameter(description = "Kimi AI API Key", required = true)
-            @RequestParam("apiKey") @NotBlank(message = "API Key 不能为空") String apiKey) {
+            @Parameter(description = "文献文件列表", required = true) @RequestPart("files") List<MultipartFile> files,
+            @Parameter(description = "Ali API Key", required = true) @RequestParam("apiKey") @NotBlank(message = "API Key 不能为空") String apiKey) {
 
         log.info("开始批量导入文献，文件数量: {}", files.size());
 

@@ -1,7 +1,5 @@
 package com.yuyuan.literature.service;
 
-import cn.hutool.core.io.FileUtil;
-import cn.hutool.core.util.StrUtil;
 import com.yuyuan.literature.common.exception.BusinessException;
 import com.yuyuan.literature.common.result.ResultCode;
 import lombok.extern.slf4j.Slf4j;
@@ -75,7 +73,7 @@ public class FileProcessingService {
             Path filePath = uploadDir.resolve(uniqueFilename);
             Files.copy(file.getInputStream(), filePath);
             
-            log.info("文件保存成功: {}", filePath.toString());
+            log.info("文件保存成功: {}", filePath);
             return filePath.toString();
             
         } catch (IOException e) {
@@ -125,7 +123,7 @@ public class FileProcessingService {
         }
 
         String originalFilename = file.getOriginalFilename();
-        if (StrUtil.isBlank(originalFilename)) {
+        if (originalFilename == null || originalFilename.trim().isEmpty()) {
             throw new BusinessException("文件名不能为空");
         }
 
@@ -184,7 +182,7 @@ public class FileProcessingService {
      * 解析 Markdown 文件内容
      */
     private String extractMarkdownContent(File file) throws IOException {
-        String markdownContent = FileUtil.readString(file, StandardCharsets.UTF_8);
+        String markdownContent = Files.readString(file.toPath(), StandardCharsets.UTF_8);
         
         // 使用 CommonMark 解析 Markdown 并转换为纯文本
         Parser parser = Parser.builder().build();
@@ -198,7 +196,7 @@ public class FileProcessingService {
      * 解析文件大小字符串
      */
     private long parseFileSize(String sizeStr) {
-        if (StrUtil.isBlank(sizeStr)) {
+        if (sizeStr == null || sizeStr.trim().isEmpty()) {
             return 10 * 1024 * 1024; // 默认 10MB
         }
         

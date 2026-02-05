@@ -27,8 +27,7 @@ public class Knife4jConfig {
         return new OpenAPI()
                 .info(apiInfo())
                 .servers(List.of(
-                        new Server().url("http://localhost:8080/api").description("本地开发环境"),
-                        new Server().url("https://api.example.com").description("生产环境")
+                        new Server().url("http://localhost:8086/api").description("本地开发环境")
                 ));
     }
 

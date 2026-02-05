@@ -1,11 +1,10 @@
 package com.yuyuan.literature.service;
 
-import cn.hutool.core.util.StrUtil;
-import cn.hutool.json.JSONObject;
-import cn.hutool.json.JSONUtil;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.yuyuan.literature.common.exception.BusinessException;
 import com.yuyuan.literature.common.result.ResultCode;
-import com.yuyuan.literature.dto.KimiChatRequest;
+import com.yuyuan.literature.dto.ChatCompletionsRequest;
+import com.yuyuan.literature.dto.ChatCompletionsResponse;
 import lombok.extern.slf4j.Slf4j;
 import okhttp3.*;
 import okhttp3.sse.EventSource;
@@ -36,10 +35,10 @@ import java.util.concurrent.TimeUnit;
 @Service
 public class LiteratureAiService {
 
-    @Value("${literature.ai.base-url:https://api.moonshot.cn/v1}")
+    @Value("${literature.ai.base-url:https://dashscope.aliyuncs.com/compatible-mode/v1}")
     private String baseUrl;
 
-    @Value("${literature.ai.model:moonshot-v1-8k}")
+    @Value("${literature.ai.model:qwen-plus}")
     private String model;
 
     @Value("${literature.ai.max-tokens:4000}")
@@ -59,13 +58,15 @@ public class LiteratureAiService {
 
     private final OkHttpClient httpClient;
     private final ResourceLoader resourceLoader;
+    private final ObjectMapper objectMapper;
 
     // 缓存系统提示词内容
     private String cachedSystemPrompt;
     private String cachedClassificationPrompt;
 
-    public LiteratureAiService(ResourceLoader resourceLoader) {
+    public LiteratureAiService(ResourceLoader resourceLoader, ObjectMapper objectMapper) {
         this.resourceLoader = resourceLoader;
+        this.objectMapper = objectMapper;
         this.httpClient = new OkHttpClient.Builder()
                 .connectTimeout(30, TimeUnit.SECONDS)
                 .readTimeout(5, TimeUnit.MINUTES)
@@ -117,7 +118,7 @@ public class LiteratureAiService {
 
             // 使用 BufferedReader 逐行读取，效率更高
             try (InputStreamReader reader = new InputStreamReader(inputStream, StandardCharsets.UTF_8);
-                 BufferedReader bufferedReader = new BufferedReader(reader)) {
+                    BufferedReader bufferedReader = new BufferedReader(reader)) {
 
                 StringBuilder contentBuilder = new StringBuilder();
                 String line;
@@ -126,8 +127,7 @@ public class LiteratureAiService {
                 }
 
                 String content = contentBuilder.toString();
-
-                if (StrUtil.isBlank(content)) {
+                if (content == null || content.trim().isEmpty()) {
                     throw new BusinessException(ResultCode.ERROR, "系统提示词文件内容为空: " + filePath);
                 }
 
@@ -151,26 +151,18 @@ public class LiteratureAiService {
     public String generateReadingGuide(String apiKey, String fileContent) {
         try {
             // 构建请求
-            KimiChatRequest chatRequest = buildChatRequest(fileContent);
-            // 设置为非流式
+            ChatCompletionsRequest chatRequest = buildChatRequest(fileContent);
             chatRequest.setStream(false);
-            String requestBody = JSONUtil.toJsonStr(chatRequest);
+            String requestBody = objectMapper.writeValueAsString(chatRequest);
 
-            log.info("发送 Kimi AI 非流式请求，模型: {}, 内容长度: {}", model, fileContent.length());
+            log.info("发送 AI 非流式请求，模型: {}, 内容长度: {}", model, fileContent.length());
 
-            // 构建 HTTP 请求（非流式）
-            Request request = new Request.Builder()
-                    .url(baseUrl + "/chat/completions")
-                    .header("Authorization", "Bearer " + apiKey)
-                    .header("Content-Type", "application/json; charset=utf-8")
-                    .header("Accept-Charset", "UTF-8")
-                    .post(RequestBody.create(requestBody, MediaType.parse("application/json; charset=utf-8")))
-                    .build();
+            Request request = createRequest(apiKey, requestBody, false);
 
             // 同步调用获取完整响应
             try (Response response = httpClient.newCall(request).execute()) {
                 if (!response.isSuccessful()) {
-                    String errorMsg = "Kimi AI 请求失败: " + response.code() + " - " + response.message();
+                    String errorMsg = "AI 请求失败: " + response.code() + " - " + response.message();
                     if (response.body() != null) {
                         errorMsg += " - " + response.body().string();
                     }
@@ -178,28 +170,24 @@ public class LiteratureAiService {
                 }
 
                 if (response.body() == null) {
-                    throw new BusinessException(ResultCode.THIRD_PARTY_SERVICE_ERROR, "Kimi AI 响应体为空");
+                    throw new BusinessException(ResultCode.THIRD_PARTY_SERVICE_ERROR, "AI 响应体为空");
                 }
 
                 String responseBody = response.body().string();
-                log.debug("Kimi AI 响应: {}", responseBody);
+                log.debug("AI 响应: {}", responseBody);
+                ChatCompletionsResponse resp = objectMapper.readValue(responseBody, ChatCompletionsResponse.class);
+                String content = resp.getFirstMessageContent();
+                if (content == null)
 
-                // 解析响应
-                JSONObject jsonResponse = JSONUtil.parseObj(responseBody);
-                String content = jsonResponse.getJSONArray("choices")
-                        .getJSONObject(0)
-                        .getJSONObject("message")
-                        .getStr("content", "");
-
-                if (StrUtil.isBlank(content)) {
-                    throw new BusinessException(ResultCode.THIRD_PARTY_SERVICE_ERROR, "AI 返回内容为空");
-                }
+                    if (content == null || content.trim().isEmpty()) {
+                        throw new BusinessException(ResultCode.THIRD_PARTY_SERVICE_ERROR, "AI 返回内容为空");
+                    }
 
                 log.info("阅读指南生成成功，内容长度: {}", content.length());
                 return content;
 
             } catch (IOException e) {
-                log.error("Kimi AI 请求异常", e);
+                log.error("AI 请求异常", e);
                 throw new BusinessException(ResultCode.NETWORK_ERROR, "AI 服务请求异常: " + e.getMessage());
             }
 
@@ -215,36 +203,29 @@ public class LiteratureAiService {
     /**
      * 生成文献阅读指南（SSE 流式响应）
      *
-     * @param apiKey           API Key
-     * @param fileContent      文献内容
-     * @param sseEmitter       SSE 发射器
-     * @param contentCollector 内容收集器（可选）
+     * @param apiKey            API Key
+     * @param fileContent       文献内容
+     * @param sseEmitter        SSE 发射器
+     * @param literatureId      文献ID
+     * @param literatureService 文献服务
      */
-    public void generateReadingGuideStream(String apiKey, String fileContent, SseEmitter sseEmitter, StringBuilder contentCollector) {
+    public void generateReadingGuideStream(String apiKey, String fileContent, SseEmitter sseEmitter,
+            Long literatureId, LiteratureService literatureService) {
         CompletableFuture.runAsync(() -> {
             try {
                 // 构建请求
-                KimiChatRequest chatRequest = buildChatRequest(fileContent);
-                String requestBody = JSONUtil.toJsonStr(chatRequest);
+                ChatCompletionsRequest chatRequest = buildChatRequest(fileContent);
+                String requestBody = objectMapper.writeValueAsString(chatRequest);
 
-                log.info("发送 Kimi AI 请求，模型: {}, 内容长度: {}", model, fileContent.length());
+                log.info("发送 AI 请求，模型: {}, 内容长度: {}", model, fileContent.length());
 
-                // 构建 HTTP 请求
-                Request request = new Request.Builder()
-                        .url(baseUrl + "/chat/completions")
-                        .header("Authorization", "Bearer " + apiKey)
-                        .header("Content-Type", "application/json; charset=utf-8")
-                        .header("Accept", "text/event-stream")
-                        .header("Accept-Charset", "UTF-8")
-                        .header("Cache-Control", "no-cache")
-                        .post(RequestBody.create(requestBody, MediaType.parse("application/json; charset=utf-8")))
-                        .build();
+                Request request = createRequest(apiKey, requestBody, true);
 
                 // 创建 EventSource 监听器
                 EventSourceListener listener = new EventSourceListener() {
                     @Override
                     public void onOpen(EventSource eventSource, Response response) {
-                        log.info("Kimi AI SSE 连接已建立");
+                        log.info("AI SSE 连接已建立");
                     }
 
                     @Override
@@ -260,33 +241,31 @@ public class LiteratureAiService {
                             }
 
                             // 跳过空数据
-                            if (StrUtil.isBlank(data)) {
+                            if (data == null || data.trim().isEmpty()) {
                                 return;
                             }
 
-                            // 解析 JSON 响应，保持原始格式
-                            JSONObject jsonData = JSONUtil.parseObj(data);
-                            String content = extractContentFromResponse(jsonData);
+                            ChatCompletionsResponse chunk = objectMapper.readValue(data, ChatCompletionsResponse.class);
+                            String content = chunk.getFirstDeltaContent();
+                            String finishReason = chunk.getFirstFinishReason();
 
                             // 注意：不要使用 StrUtil.isNotBlank() 来检查内容
                             // 因为它会忽略只包含空格的字符串，这正是我们要保留的
                             if (content != null) {
-                                // 收集内容到 contentCollector（保持原始格式，包括空格）
-                                if (contentCollector != null) {
-                                    contentCollector.append(content);
+                                sseEmitter.send(SseEmitter.event().name("content").data(content));
+                                try {
+                                    literatureService.updateReadingGuideAppend(literatureId, content);
+                                } catch (Exception ex) {
+                                    log.warn("阅读指南追加写库失败，ID: {}", literatureId, ex);
                                 }
-
-                                // 立即发送内容片段到前端（保持原始格式）
-                                sseEmitter.send(SseEmitter.event()
-                                        .name("content")
-                                        .data(content.replace("\n", "<empty-line>").replace(" ", "<empty-space>")));
-
-                                // 调试日志：显示内容长度和前50个字符（包括空格）
                                 if (log.isDebugEnabled()) {
-                                    String preview = content.length() > 50 ?
-                                            content.substring(0, 50) + "..." : content;
+                                    String preview = content.length() > 50 ? content.substring(0, 50) + "..." : content;
                                     log.debug("发送内容片段 [长度: {}]: '{}'", content.length(), preview);
                                 }
+                            }
+
+                            if (finishReason != null) {
+                                sseEmitter.send(SseEmitter.event().name("finish").data(finishReason));
                             }
 
                         } catch (Exception e) {
@@ -296,12 +275,12 @@ public class LiteratureAiService {
 
                     @Override
                     public void onClosed(EventSource eventSource) {
-                        log.info("Kimi AI SSE 连接已关闭");
+                        log.info("AI SSE 连接已关闭");
                     }
 
                     @Override
                     public void onFailure(EventSource eventSource, Throwable t, Response response) {
-                        log.error("Kimi AI SSE 连接失败", t);
+                        log.error("AI SSE 连接失败", t);
                         try {
                             String errorMsg = "AI 服务连接失败";
                             if (response != null) {
@@ -360,8 +339,8 @@ public class LiteratureAiService {
     /**
      * 构建聊天请求
      */
-    private KimiChatRequest buildChatRequest(String fileContent) {
-        KimiChatRequest request = new KimiChatRequest();
+    private ChatCompletionsRequest buildChatRequest(String fileContent) {
+        ChatCompletionsRequest request = new ChatCompletionsRequest();
         request.setModel(model);
         request.setMaxTokens(maxTokens);
         request.setTemperature(temperature);
@@ -369,38 +348,10 @@ public class LiteratureAiService {
 
         // 构建消息，使用从文件加载的系统提示词
         request.setMessages(Arrays.asList(
-                new KimiChatRequest.Message("system", getSystemPrompt()),
-                new KimiChatRequest.Message("user", "请为以下文献生成阅读指南：\n\n" + fileContent)
-        ));
+                new ChatCompletionsRequest.Message("system", getSystemPrompt()),
+                new ChatCompletionsRequest.Message("user", "请为以下文献生成阅读指南：\n\n" + fileContent)));
 
         return request;
-    }
-
-    /**
-     * 从响应中提取内容（保持原始格式，包括空格）
-     */
-    private String extractContentFromResponse(JSONObject jsonData) {
-        try {
-            // 使用更安全的方式提取内容，避免空格丢失
-            JSONObject delta = jsonData.getJSONArray("choices")
-                    .getJSONObject(0)
-                    .getJSONObject("delta");
-
-            // 检查是否存在 content 字段
-            if (delta.containsKey("content")) {
-                Object contentObj = delta.get("content");
-                if (contentObj != null) {
-                    // 直接返回字符串，不进行任何 trim 或格式化操作
-                    return contentObj.toString();
-                }
-            }
-
-            return null; // 返回 null 而不是空字符串，让调用方判断
-
-        } catch (Exception e) {
-            log.debug("提取内容失败: {}", jsonData, e);
-            return null;
-        }
     }
 
     /**
@@ -412,82 +363,79 @@ public class LiteratureAiService {
      * @param literatureService 文献服务
      */
     public void generateClassificationWithVirtualThread(String apiKey, String readingGuide, Long literatureId,
-                                                        LiteratureService literatureService) {
+            LiteratureService literatureService) {
         // 使用虚拟线程
         Thread.startVirtualThread(() -> {
             try {
                 // 构建分类请求
-                KimiChatRequest chatRequest = buildClassificationRequest(readingGuide);
-                String requestBody = JSONUtil.toJsonStr(chatRequest);
+                ChatCompletionsRequest chatRequest = buildClassificationRequest(readingGuide);
+                String requestBody = objectMapper.writeValueAsString(chatRequest);
 
                 log.info("发送文献分类请求，模型: {}, 内容长度: {}", model, readingGuide.length());
 
-                // 构建 HTTP 请求（非流式）
-                Request request = new Request.Builder()
-                        .url(baseUrl + "/chat/completions")
-                        .header("Authorization", "Bearer " + apiKey)
-                        .header("Content-Type", "application/json; charset=utf-8")
-                        .header("Accept-Charset", "UTF-8")
-                        .post(RequestBody.create(requestBody, MediaType.parse("application/json; charset=utf-8")))
-                        .build();
+                Request request = createRequest(apiKey, requestBody, false);
 
                 // 同步调用获取完整响应
                 try (Response response = httpClient.newCall(request).execute()) {
                     if (!response.isSuccessful()) {
-                        String errorMsg = "Kimi AI 分类请求失败: " + response.code() + " - " + response.message();
+                        String errorMsg = "AI 分类请求失败: " + response.code() + " - " + response.message();
                         if (response.body() != null) {
                             errorMsg += " - " + response.body().string();
                         }
                         log.error(errorMsg);
-                        literatureService.updateStatus(literatureId, com.yuyuan.literature.entity.Literature.Status.COMPLETED.getCode());
+                        literatureService.updateStatus(literatureId,
+                                com.yuyuan.literature.entity.Literature.Status.COMPLETED.getCode());
                         return;
                     }
 
                     if (response.body() == null) {
                         log.error("AI 响应内容为空");
-                        literatureService.updateStatus(literatureId, com.yuyuan.literature.entity.Literature.Status.COMPLETED.getCode());
+                        literatureService.updateStatus(literatureId,
+                                com.yuyuan.literature.entity.Literature.Status.COMPLETED.getCode());
                         return;
                     }
 
                     String responseBody = response.body().string();
                     log.debug("AI 分类响应: {}", responseBody);
+                    ChatCompletionsResponse resp = objectMapper.readValue(responseBody, ChatCompletionsResponse.class);
+                    String content = resp.getFirstMessageContent();
+                    if (content == null)
+                        content = "";
 
-                    // 解析响应获取分类内容
-                    JSONObject jsonResponse = JSONUtil.parseObj(responseBody);
-                    String content = jsonResponse.getJSONArray("choices")
-                            .getJSONObject(0)
-                            .getJSONObject("message")
-                            .getStr("content", "");
-
-                    if (StrUtil.isBlank(content)) {
+                    if (content == null || content.trim().isEmpty()) {
                         log.error("AI 返回的分类内容为空");
-                        literatureService.updateStatus(literatureId, com.yuyuan.literature.entity.Literature.Status.COMPLETED.getCode());
+                        literatureService.updateStatus(literatureId,
+                                com.yuyuan.literature.entity.Literature.Status.COMPLETED.getCode());
                         return;
                     }
 
                     // 解析分类结果并直接保存到数据库
                     try {
-                        com.yuyuan.literature.dto.ClassificationResponse classification =
-                                JSONUtil.toBean(content.trim(), com.yuyuan.literature.dto.ClassificationResponse.class);
+                        com.yuyuan.literature.dto.ClassificationResponse classification = objectMapper
+                                .readValue(content.trim(), com.yuyuan.literature.dto.ClassificationResponse.class);
 
                         // 更新数据库
-                        literatureService.updateClassification(literatureId, classification.getTags(), classification.getDesc());
+                        literatureService.updateClassification(literatureId, classification.getTags(),
+                                classification.getDesc());
                         log.info("文献分类生成并保存成功，ID: {}, 标签数量: {}", literatureId, classification.getTags().size());
 
                     } catch (Exception e) {
                         log.error("解析分类结果失败: {}", content, e);
                         // 即使分类失败，也标记为完成状态
-                        literatureService.updateStatus(literatureId, com.yuyuan.literature.entity.Literature.Status.COMPLETED.getCode());
+                        literatureService.updateStatus(literatureId,
+                                com.yuyuan.literature.entity.Literature.Status.COMPLETED.getCode());
                     }
 
                 } catch (IOException e) {
                     log.error("调用 AI 分类服务失败", e);
-                    literatureService.updateStatus(literatureId, com.yuyuan.literature.entity.Literature.Status.COMPLETED.getCode());
+                    literatureService.updateStatus(literatureId,
+                            com.yuyuan.literature.entity.Literature.Status.COMPLETED.getCode());
                 }
 
             } catch (Exception e) {
                 log.error("生成文献分类失败", e);
-                literatureService.updateStatus(literatureId, com.yuyuan.literature.entity.Literature.Status.COMPLETED.getCode());
+                literatureService.updateStatus(literatureId,
+                        com.yuyuan.literature.entity.Literature.Status.COMPLETED.getCode());
             }
         });
     }
@@ -495,23 +443,21 @@ public class LiteratureAiService {
     /**
      * 构建分类请求
      */
-    private KimiChatRequest buildClassificationRequest(String readingGuide) {
-        KimiChatRequest request = new KimiChatRequest();
+    private ChatCompletionsRequest buildClassificationRequest(String readingGuide) {
+        ChatCompletionsRequest request = new ChatCompletionsRequest();
         request.setModel(model);
         request.setMaxTokens(500); // 分类响应不需要太多 token
         request.setResponseFormat(
-                KimiChatRequest.ResponseFormat.builder()
+                ChatCompletionsRequest.ResponseFormat.builder()
                         .type("json_object")
-                        .build()
-        );
+                        .build());
         request.setTemperature(0.3); // 降低温度，提高准确性
         request.setStream(false); // 非流式响应
 
         // 构建消息，使用从文件加载的分类提示词
         request.setMessages(Arrays.asList(
-                new KimiChatRequest.Message("system", getClassificationPrompt()),
-                new KimiChatRequest.Message("user", "请为以下文献阅读指南生成分类和描述：\n\n" + readingGuide)
-        ));
+                new ChatCompletionsRequest.Message("system", getClassificationPrompt()),
+                new ChatCompletionsRequest.Message("user", "请为以下文献阅读指南生成分类和描述：\n\n" + readingGuide)));
 
         return request;
     }
@@ -520,12 +466,24 @@ public class LiteratureAiService {
      * 验证 API Key
      */
     public void validateApiKey(String apiKey) {
-        if (StrUtil.isBlank(apiKey)) {
+        if (apiKey == null || apiKey.trim().isEmpty()) {
             throw new BusinessException(ResultCode.BAD_REQUEST, "API Key 不能为空");
         }
 
-        if (!apiKey.startsWith("sk-")) {
+        if (apiKey.length() < 10) {
             throw new BusinessException(ResultCode.BAD_REQUEST, "API Key 格式错误");
         }
+    }
+
+    private Request createRequest(String apiKey, String requestBody, boolean sse) {
+        Request.Builder builder = new Request.Builder()
+                .url(baseUrl + "/chat/completions")
+                .header("Authorization", "Bearer " + apiKey)
+                .header("Content-Type", "application/json; charset=utf-8")
+                .post(RequestBody.create(requestBody, MediaType.parse("application/json; charset=utf-8")));
+        if (sse) {
+            builder.header("Accept", "text/event-stream").header("Cache-Control", "no-cache");
+        }
+        return builder.build();
     }
 }
