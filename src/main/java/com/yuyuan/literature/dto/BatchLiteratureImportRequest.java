@@ -24,7 +24,4 @@ public class BatchLiteratureImportRequest {
     @Schema(description = "文献文件列表", required = true)
     private List<MultipartFile> files;
 
-    @NotBlank(message = "API Key 不能为空")
-    @Schema(description = "Kimi Ali API Key", required = true)
-    private String apiKey;
 }
