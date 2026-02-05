@@ -12,21 +12,20 @@ import com.yuyuan.literature.service.LiteratureService;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.Parameter;
 import io.swagger.v3.oas.annotations.tags.Tag;
+import jakarta.validation.Valid;
+import jakarta.validation.constraints.NotNull;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.MediaType;
+import org.springframework.http.codec.ServerSentEvent;
 import org.springframework.validation.annotation.Validated;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
-import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
+import reactor.core.scheduler.Schedulers;
 
-import jakarta.validation.Valid;
-import jakarta.validation.constraints.NotBlank;
-import jakarta.validation.constraints.NotNull;
-
-import java.io.IOException;
 import java.util.List;
-import java.util.concurrent.TimeUnit;
 
 /**
  * 文献助手控制器
@@ -42,182 +41,155 @@ import java.util.concurrent.TimeUnit;
 @Validated
 public class LiteratureController {
 
-    private final FileProcessingService fileProcessingService;
-    private final LiteratureAiService literatureAiService;
-    private final LiteratureService literatureService;
+        private final FileProcessingService fileProcessingService;
+        private final LiteratureAiService literatureAiService;
+        private final LiteratureService literatureService;
 
-    /**
-     * 生成文献阅读指南
-     *
-     * @param file   上传的文献文件
-     * @param apiKey Ali API Key
-     * @return SSE 流式响应
-     */
-    @PostMapping(value = "/generate-guide", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
-    @Operation(summary = "生成文献阅读指南", description = "上传文献文件，AI 生成阅读指南（SSE 流式响应）")
-    public SseEmitter generateReadingGuide(
-            @Parameter(description = "文献文件（支持 PDF、Word、Markdown）", required = true) @RequestParam("file") MultipartFile file,
-            @Parameter(description = "Ali API Key", required = true) @RequestParam("apiKey") @NotBlank(message = "API Key 不能为空") String apiKey) {
+        /**
+         * 生成文献阅读指南
+         *
+         * @param file 上传的文献文件
+         * @return SSE 流式响应
+         */
+        @PostMapping(value = "/generate-guide", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+        @Operation(summary = "生成文献阅读指南", description = "上传文献文件，AI 生成阅读指南（SSE 流式响应）")
+        public Flux<ServerSentEvent<String>> generateReadingGuide(
+                        @Parameter(description = "文献文件（支持 PDF、Word、Markdown）", required = true) @RequestParam("file") MultipartFile file) {
 
-        log.info("开始生成文献阅读指南，文件名: {}, 文件大小: {} bytes",
-                file.getOriginalFilename(), file.getSize());
+                return Flux.defer(() -> {
+                        Flux<ServerSentEvent<String>> start = Flux
+                                        .just(ServerSentEvent.<String>builder().event("start").data("开始处理文献文件...")
+                                                        .build());
 
-        // 创建 SSE 发射器，设置超时时间为 10 分钟
-        SseEmitter sseEmitter = new SseEmitter(TimeUnit.MINUTES.toMillis(10));
+                        Flux<ServerSentEvent<String>> pipeline = Mono
+                                        .fromCallable(() -> fileProcessingService.saveFile(file))
+                                        .subscribeOn(Schedulers.boundedElastic())
+                                        .flatMapMany(filePath -> {
+                                                Flux<ServerSentEvent<String>> progress1 = Flux
+                                                                .just(ServerSentEvent.<String>builder()
+                                                                                .event("progress")
+                                                                                .data("文件保存成功，开始解析内容...").build());
+                                                Flux<ServerSentEvent<String>> sequence = Mono
+                                                                .fromCallable(() -> fileProcessingService
+                                                                                .extractFileContent(filePath))
+                                                                .subscribeOn(Schedulers.boundedElastic())
+                                                                .flatMapMany(fileContent -> Mono
+                                                                                .fromCallable(() -> literatureService
+                                                                                                .createLiterature(file,
+                                                                                                                filePath,
+                                                                                                                fileContent.length()))
+                                                                                .subscribeOn(Schedulers
+                                                                                                .boundedElastic())
+                                                                                .flatMapMany(literatureId -> {
+                                                                                        Flux<ServerSentEvent<String>> progress2 = Flux
+                                                                                                        .just(ServerSentEvent
+                                                                                                                        .<String>builder()
+                                                                                                                        .event("progress")
+                                                                                                                        .data("内容解析成功，开始生成阅读指南...")
+                                                                                                                        .build());
+                                                                                        Flux<ServerSentEvent<String>> contentEvents = literatureAiService
+                                                                                                        .generateReadingGuideFlux(
+                                                                                                                        fileContent,
+                                                                                                                        literatureId,
+                                                                                                                        literatureService)
+                                                                                                        .map(token -> ServerSentEvent
+                                                                                                                        .<String>builder()
+                                                                                                                        .event("content")
+                                                                                                                        .data(token)
+                                                                                                                        .build());
+                                                                                        contentEvents = contentEvents.doOnComplete(() -> {
+                                                                                            String readingGuide = literatureService.getById(literatureId)
+                                                                                                    .getReadingGuide();
+                                                                                            if (readingGuide != null && !readingGuide.trim().isEmpty()) {
+                                                                                                literatureService.updateReadingGuide(literatureId, readingGuide);
+                                                                                                literatureAiService.generateClassificationWithVirtualThread(
+                                                                                                        readingGuide, literatureId, literatureService);
+                                                                                            } else {
+                                                                                                literatureService.updateStatus(literatureId,
+                                                                                                        Literature.Status.COMPLETED.getCode());
+                                                                                            }
+                                                                                        });
+                                                                                        Flux<ServerSentEvent<String>> complete = Flux
+                                                                                                        .just(ServerSentEvent
+                                                                                                                        .<String>builder()
+                                                                                                                        .event("complete")
+                                                                                                                        .data("生成完成")
+                                                                                                                        .build());
+                                                                                        return Flux.concat(progress2,
+                                                                                                        contentEvents,
+                                                                                                        complete);
+                                                                                }));
+                                                return Flux.concat(progress1, sequence);
+                                        })
+                                        .onErrorResume(error -> Flux
+                                                        .just(ServerSentEvent.<String>builder().event("error")
+                                                                        .data("处理失败: " + error.getMessage()).build()));
 
-        Long literatureId = null;
-        String filePath = null;
-
-        try {
-            // 验证 API Key
-            literatureAiService.validateApiKey(apiKey);
-
-            // 发送开始事件
-            sseEmitter.send(SseEmitter.event()
-                    .name("start")
-                    .data("开始处理文献文件..."));
-
-            // 保存文件
-            filePath = fileProcessingService.saveFile(file);
-
-            // 发送文件保存成功事件
-            sseEmitter.send(SseEmitter.event()
-                    .name("progress")
-                    .data("文件保存成功，开始解析内容..."));
-
-            // 解析文件内容
-            String fileContent = fileProcessingService.extractFileContent(filePath);
-
-            // 创建文献记录
-            literatureId = literatureService.createLiterature(file, filePath, fileContent.length());
-
-            // 发送内容解析成功事件
-            sseEmitter.send(SseEmitter.event()
-                    .name("progress")
-                    .data("内容解析成功，开始生成阅读指南..."));
-
-            // 异步生成阅读指南（流式写库）
-            literatureAiService.generateReadingGuideStream(apiKey, fileContent, sseEmitter, literatureId,
-                    literatureService);
-
-            // 设置 SSE 完成回调，在阅读指南完成后启动分类
-            final Long finalLiteratureId = literatureId;
-
-            sseEmitter.onCompletion(() -> {
-                log.info("阅读指南生成完成，开始后台分类处理");
-
-                // 从数据库获取完整阅读指南
-                String readingGuide = literatureService.getById(finalLiteratureId).getReadingGuide();
-                if (readingGuide != null && !readingGuide.trim().isEmpty()) {
-                    literatureService.updateReadingGuide(finalLiteratureId, readingGuide);
-
-                    // 使用虚拟线程进行后台分类
-                    literatureAiService.generateClassificationWithVirtualThread(
-                            apiKey, readingGuide, finalLiteratureId, literatureService);
-                } else {
-                    log.warn("阅读指南内容为空，跳过分类处理");
-                    literatureService.updateStatus(finalLiteratureId, Literature.Status.COMPLETED.getCode());
-                }
-            });
-
-            sseEmitter.onError((throwable) -> {
-                log.error("文献阅读指南生成失败，文件: {}", file.getOriginalFilename(), throwable);
-                if (finalLiteratureId != null) {
-                    literatureService.updateStatus(finalLiteratureId, Literature.Status.FAILED.getCode());
-                }
-            });
-
-            sseEmitter.onTimeout(() -> {
-                log.warn("文献阅读指南生成超时，文件: {}", file.getOriginalFilename());
-                if (finalLiteratureId != null) {
-                    literatureService.updateStatus(finalLiteratureId, Literature.Status.FAILED.getCode());
-                }
-            });
-
-        } catch (Exception e) {
-            log.error("处理文献文件失败", e);
-            if (literatureId != null) {
-                literatureService.updateStatus(literatureId, Literature.Status.FAILED.getCode());
-            }
-            try {
-                sseEmitter.send(SseEmitter.event()
-                        .name("error")
-                        .data("处理失败: " + e.getMessage()));
-                sseEmitter.completeWithError(e);
-            } catch (IOException ioException) {
-                log.error("发送错误消息失败", ioException);
-                sseEmitter.completeWithError(ioException);
-            }
+                        return Flux.concat(start, pipeline);
+                });
         }
 
-        return sseEmitter;
-    }
+        /**
+         * 分页查询文献
+         */
+        @PostMapping("/page")
+        @Operation(summary = "分页查询文献", description = "根据条件分页查询文献列表")
+        public Result<PageResult<LiteratureVO>> pageLiteratures(
+                        @Valid @RequestBody LiteratureQueryRequest request) {
 
-    /**
-     * 分页查询文献
-     */
-    @PostMapping("/page")
-    @Operation(summary = "分页查询文献", description = "根据条件分页查询文献列表")
-    public Result<PageResult<LiteratureVO>> pageLiteratures(
-            @Valid @RequestBody LiteratureQueryRequest request) {
+                log.info("分页查询文献，条件: {}", request);
 
-        log.info("分页查询文献，条件: {}", request);
+                PageResult<LiteratureVO> result = literatureService.pageLiteratures(request);
+                return Result.success(result);
+        }
 
-        PageResult<LiteratureVO> result = literatureService.pageLiteratures(request);
-        return Result.success(result);
-    }
+        /**
+         * 获取文献详情
+         */
+        @GetMapping("/{id}")
+        @Operation(summary = "获取文献详情", description = "根据ID获取文献完整信息")
+        public Result<LiteratureVO> getLiteratureDetail(
+                        @Parameter(description = "文献ID", required = true) @PathVariable @NotNull(message = "文献ID不能为空") Long id) {
 
-    /**
-     * 获取文献详情
-     */
-    @GetMapping("/{id}")
-    @Operation(summary = "获取文献详情", description = "根据ID获取文献完整信息")
-    public Result<LiteratureVO> getLiteratureDetail(
-            @Parameter(description = "文献ID", required = true) @PathVariable @NotNull(message = "文献ID不能为空") Long id) {
+                log.info("获取文献详情，ID: {}", id);
 
-        log.info("获取文献详情，ID: {}", id);
+                LiteratureVO result = literatureService.getLiteratureDetail(id);
+                return Result.success(result);
+        }
 
-        LiteratureVO result = literatureService.getLiteratureDetail(id);
-        return Result.success(result);
-    }
+        /**
+         * 下载文献文件
+         */
+        @GetMapping("/{id}/download")
+        @Operation(summary = "下载文献文件", description = "根据文献ID下载对应的原始文件")
+        public void downloadLiteratureFile(
+                        @Parameter(description = "文献ID", required = true) @PathVariable @NotNull(message = "文献ID不能为空") Long id,
+                        jakarta.servlet.http.HttpServletResponse response) {
 
-    /**
-     * 下载文献文件
-     */
-    @GetMapping("/{id}/download")
-    @Operation(summary = "下载文献文件", description = "根据文献ID下载对应的原始文件")
-    public void downloadLiteratureFile(
-            @Parameter(description = "文献ID", required = true) @PathVariable @NotNull(message = "文献ID不能为空") Long id,
-            jakarta.servlet.http.HttpServletResponse response) {
+                log.info("下载文献文件，ID: {}", id);
+                literatureService.downloadLiteratureFile(id, response);
+        }
 
-        log.info("下载文献文件，ID: {}", id);
-        literatureService.downloadLiteratureFile(id, response);
-    }
+        /**
+         * 批量导入文献
+         */
+        @PostMapping(value = "/batch-import", consumes = MediaType.MULTIPART_FORM_DATA_VALUE, produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+        @Operation(summary = "批量导入文献", description = "批量上传文献文件，AI生成阅读指南并实时返回处理状态")
+        public Flux<ServerSentEvent<String>> batchImportLiterature(
+                        @Parameter(description = "文献文件列表", required = true) @RequestPart("files") List<MultipartFile> files) {
 
-    /**
-     * 批量导入文献
-     */
-    @PostMapping(value = "/batch-import", consumes = MediaType.MULTIPART_FORM_DATA_VALUE, produces = MediaType.TEXT_EVENT_STREAM_VALUE)
-    @Operation(summary = "批量导入文献", description = "批量上传文献文件，AI生成阅读指南并实时返回处理状态")
-    public SseEmitter batchImportLiterature(
-            @Parameter(description = "文献文件列表", required = true) @RequestPart("files") List<MultipartFile> files,
-            @Parameter(description = "Ali API Key", required = true) @RequestParam("apiKey") @NotBlank(message = "API Key 不能为空") String apiKey) {
+                BatchLiteratureImportRequest request = new BatchLiteratureImportRequest();
+                request.setFiles(files);
 
-        log.info("开始批量导入文献，文件数量: {}", files.size());
+                return literatureService.batchImportLiterature(request);
+        }
 
-        BatchLiteratureImportRequest request = new BatchLiteratureImportRequest();
-        request.setFiles(files);
-        request.setApiKey(apiKey);
-
-        return literatureService.batchImportLiterature(request);
-    }
-
-    /**
-     * 健康检查接口
-     */
-    @GetMapping("/health")
-    @Operation(summary = "健康检查", description = "检查文献助手服务状态")
-    public String health() {
-        return "Literature Assistant is running!";
-    }
+        /**
+         * 健康检查接口
+         */
+        @GetMapping("/health")
+        @Operation(summary = "健康检查", description = "检查文献助手服务状态")
+        public String health() {
+                return "Literature Assistant is running!";
+        }
 }

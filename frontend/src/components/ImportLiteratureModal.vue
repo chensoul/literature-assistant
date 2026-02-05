@@ -41,30 +41,6 @@
           </el-upload>
         </el-form-item>
         
-        <el-form-item label="Ali API Key" prop="apiKey" required>
-          <el-input
-            v-model="formData.apiKey"
-            type="password"
-            placeholder="请输入您的 Ali API Key"
-            show-password
-            clearable
-          />
-          <div class="api-key-tip">
-            <el-text size="small" type="info">
-              API Key 用于生成智能阅读指南，会自动保存到浏览器本地
-            </el-text>
-            <el-button 
-              v-if="formData.apiKey" 
-              link 
-              type="danger" 
-              size="small" 
-              @click="clearSavedApiKey"
-              style="margin-left: 8px;"
-            >
-              清除保存的密钥
-            </el-button>
-          </div>
-        </el-form-item>
       </el-form>
     </div>
 
@@ -166,49 +142,12 @@ const contentRef = ref()
 
 // 表单数据
 const formData = ref({
-  file: null,
-  apiKey: ''
+  file: null
 })
 
 const fileList = ref([])
 
-// API Key 存储相关
-const API_KEY_STORAGE_KEY = 'literature_assistant_api_key'
-
-// 从 localStorage 读取保存的 API Key
-const loadSavedApiKey = () => {
-  try {
-    const savedKey = localStorage.getItem(API_KEY_STORAGE_KEY)
-    if (savedKey) {
-      formData.value.apiKey = savedKey
-    }
-  } catch (error) {
-    console.warn('读取保存的 API Key 失败:', error)
-  }
-}
-
-// 保存 API Key 到 localStorage
-const saveApiKey = (apiKey) => {
-  try {
-    if (apiKey && apiKey.trim()) {
-      localStorage.setItem(API_KEY_STORAGE_KEY, apiKey.trim())
-    }
-  } catch (error) {
-    console.warn('保存 API Key 失败:', error)
-  }
-}
-
-// 清除保存的 API Key
-const clearSavedApiKey = () => {
-  try {
-    localStorage.removeItem(API_KEY_STORAGE_KEY)
-    formData.value.apiKey = ''
-    ElMessage.success('已清除保存的 API Key')
-  } catch (error) {
-    console.warn('清除保存的 API Key 失败:', error)
-    ElMessage.error('清除失败，请重试')
-  }
-}
+// 前端不再需要 API Key，本地存储逻辑移除
 
 // 生成状态
 const isGenerating = ref(false)
@@ -236,7 +175,7 @@ const dialogVisibleComputed = computed({
 })
 
 const canSubmit = computed(() => {
-  return formData.value.file && formData.value.apiKey.trim()
+  return !!formData.value.file
 })
 
 const acceptedFileTypes = '.pdf,.doc,.docx,.md,.markdown'
@@ -245,10 +184,6 @@ const acceptedFileTypes = '.pdf,.doc,.docx,.md,.markdown'
 const formRules = {
   file: [
     { required: true, message: '请选择要上传的文件', trigger: 'change' }
-  ],
-  apiKey: [
-    { required: true, message: '请输入 Ali API Key', trigger: 'blur' },
-    { min: 10, message: 'API Key 长度不能少于 10 个字符', trigger: 'blur' }
   ]
 }
 
@@ -634,9 +569,6 @@ const renderMermaidCharts = async () => {
 
 // 组件挂载时初始化 Mermaid
 onMounted(() => {
-  // 加载保存的 API Key
-  loadSavedApiKey()
-  
   try {
     mermaid.initialize({
       startOnLoad: false,
@@ -725,9 +657,6 @@ const handleSubmit = async () => {
   try {
     await formRef.value.validate()
     
-    // 保存 API Key 到 localStorage
-    saveApiKey(formData.value.apiKey)
-    
     await startSSEGeneration()
   } catch (error) {
 
@@ -744,7 +673,6 @@ const startSSEGeneration = async () => {
     // 创建 FormData
     const formDataToSend = new FormData()
     formDataToSend.append('file', formData.value.file)
-    formDataToSend.append('apiKey', formData.value.apiKey)
     
     // 开始连接
     await connectSSE(formDataToSend)
@@ -1078,11 +1006,9 @@ const resetForm = () => {
   renderedContent.value = ''
   progressMessage.value = ''
   
-  // 重置表单数据（保留API Key）
-  const savedApiKey = formData.value.apiKey
+  // 重置表单数据
   formData.value = {
-    file: null,
-    apiKey: savedApiKey // 保留API Key，方便重新尝试
+    file: null
   }
   fileList.value = []
   
@@ -1151,9 +1077,7 @@ const handleClose = () => {
   color: #909399;
 }
 
-.api-key-tip {
-  margin-top: 8px;
-}
+
 
 .generation-area {
   padding: 20px 0;

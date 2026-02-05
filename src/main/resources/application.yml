@@ -2,6 +2,16 @@ spring:
   application:
     name: literature-assistant
   
+  ai:
+    openai:
+      base-url: https://dashscope.aliyuncs.com/compatible-mode
+      api-key: ${DATASCOPE_API_KEY:}
+      chat:
+        options:
+          model: qwen-plus
+          temperature: 0.7
+          max-tokens: 20480
+  
   # Jackson 配置
   jackson:
     date-format: yyyy-MM-dd HH:mm:ss
@@ -10,12 +20,12 @@ spring:
       write-dates-as-timestamps: false
       fail-on-empty-beans: false
     deserialization:
-      fail-on-unknown-properties: true
+      fail-on-unknown-properties: false
   
   # 文件上传配置
   servlet:
     multipart:
-      max-file-size: 10MB
+      max-file-size: 50MB
       max-request-size: 100MB
 
   # 数据源配置
@@ -77,14 +87,3 @@ literature:
     upload-path: ./uploads/documents
     max-file-size: 10MB
     allowed-extensions: pdf,doc,docx,md,markdown
-  
-  # AI 配置
-  ai:
-    base-url: https://dashscope.aliyuncs.com/compatible-mode/v1
-    model: qwen-plus
-    max-tokens: 20480
-    temperature: 0.7
-    timeout: 60000
-    
-    system-prompt-file: classpath:prompts/literature-guide-system-prompt.txt
-    classification-prompt-file: classpath:prompts/literature-classification-system-prompt.txt

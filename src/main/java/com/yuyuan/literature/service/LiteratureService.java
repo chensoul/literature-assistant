@@ -7,7 +7,8 @@ import com.yuyuan.literature.dto.LiteratureQueryRequest;
 import com.yuyuan.literature.dto.LiteratureVO;
 import com.yuyuan.literature.entity.Literature;
 import org.springframework.web.multipart.MultipartFile;
-import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
+import org.springframework.http.codec.ServerSentEvent;
+import reactor.core.publisher.Flux;
 
 import java.util.List;
 
@@ -84,7 +85,7 @@ public interface LiteratureService extends IService<Literature> {
      * @param request 批量导入请求
      * @return SSE发射器
      */
-    SseEmitter batchImportLiterature(BatchLiteratureImportRequest request);
+    Flux<ServerSentEvent<String>> batchImportLiterature(BatchLiteratureImportRequest request);
 
     /**
      * 追加更新阅读指南内容（流式写入）

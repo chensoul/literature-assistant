@@ -14,13 +14,15 @@ import com.yuyuan.literature.mapper.LiteratureMapper;
 import com.yuyuan.literature.service.FileProcessingService;
 import com.yuyuan.literature.service.LiteratureAiService;
 import com.yuyuan.literature.service.LiteratureService;
+import jakarta.servlet.http.HttpServletResponse;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.codec.ServerSentEvent;
 import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
-import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
-
-import jakarta.servlet.http.HttpServletResponse;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
+import reactor.core.scheduler.Schedulers;
 
 import java.io.File;
 import java.io.OutputStream;
@@ -29,9 +31,6 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Paths;
 import java.util.List;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.Executor;
-import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 
@@ -48,9 +47,6 @@ public class LiteratureServiceImpl extends ServiceImpl<LiteratureMapper, Literat
 
     private final FileProcessingService fileProcessingService;
     private final LiteratureAiService literatureAiService;
-
-    // 虚拟线程池，用于并发处理文件
-    private final Executor virtualThreadExecutor = Executors.newVirtualThreadPerTaskExecutor();
 
     @Override
     public Long createLiterature(MultipartFile file, String filePath, Integer contentLength) {
@@ -236,129 +232,79 @@ public class LiteratureServiceImpl extends ServiceImpl<LiteratureMapper, Literat
     }
 
     @Override
-    public SseEmitter batchImportLiterature(BatchLiteratureImportRequest request) {
-        log.info("开始批量导入文献，文件数量: {}", request.getFiles().size());
-
-        // 30分钟超时
-        SseEmitter sseEmitter = new SseEmitter(30 * 60 * 1000L);
+    public Flux<ServerSentEvent<String>> batchImportLiterature(BatchLiteratureImportRequest request) {
         AtomicInteger completedCount = new AtomicInteger(0);
-        AtomicInteger totalCount = new AtomicInteger(request.getFiles().size());
         AtomicInteger errorCount = new AtomicInteger(0);
+        int total = request.getFiles().size();
 
-        // 验证API Key
-        literatureAiService.validateApiKey(request.getApiKey());
+        Flux<ServerSentEvent<String>> start = Flux.just(ServerSentEvent.<String>builder()
+                .event("batch_start")
+                .data("{\"total\": " + total + ", \"message\": \"开始批量处理\"}")
+                .build());
 
-        // 发送批量开始事件
-        sendSseEvent(sseEmitter, "batch_start", "{\"total\": " + totalCount.get() + ", \"message\": \"开始批量处理\"}");
+        Flux<ServerSentEvent<String>> processing = Flux.range(0, total)
+                .concatMap(index -> {
+                    MultipartFile file = request.getFiles().get(index);
+                    Flux<ServerSentEvent<String>> fileStart = Flux.just(ServerSentEvent.<String>builder()
+                            .event("file_start")
+                            .data("{\"index\": " + index + ", \"filename\": \"" + file.getOriginalFilename()
+                                    + "\", \"message\": \"开始处理文件\"}")
+                            .build());
+                    Mono<String> filePathMono = Mono.fromCallable(() -> fileProcessingService.saveFile(file))
+                            .subscribeOn(Schedulers.boundedElastic());
+                    Mono<String> fileContentMono = filePathMono
+                            .flatMap(fp -> Mono.fromCallable(() -> fileProcessingService.extractFileContent(fp))
+                                    .subscribeOn(Schedulers.boundedElastic()));
+                    Mono<Long> literatureIdMono = filePathMono.zipWith(fileContentMono)
+                            .flatMap(tuple -> Mono.fromCallable(
+                                            () -> this.createLiterature(file, tuple.getT1(), tuple.getT2().length()))
+                                    .subscribeOn(Schedulers.boundedElastic()));
+                    Mono<ServerSentEvent<String>> savedEvent = literatureIdMono.map(literatureId -> ServerSentEvent
+                            .<String>builder()
+                            .event("file_saved")
+                            .data("{\"index\": " + index + ", \"literatureId\": " + literatureId
+                                    + ", \"message\": \"文件保存成功，开始生成阅读指南\"}")
+                            .build());
+                    Mono<ServerSentEvent<String>> result = literatureIdMono
+                            .zipWith(fileContentMono)
+                            .flatMap(tuple -> Mono.fromCallable(() -> {
+                                Long literatureId = tuple.getT1();
+                                String fileContent = tuple.getT2();
+                                String readingGuide = literatureAiService.generateReadingGuide(fileContent);
+                                if (readingGuide != null && !readingGuide.trim().isEmpty()) {
+                                    this.updateReadingGuide(literatureId, readingGuide);
+                                    literatureAiService.generateClassificationWithVirtualThread(readingGuide,
+                                            literatureId, this);
+                                } else {
+                                    this.updateStatus(literatureId, Literature.Status.COMPLETED.getCode());
+                                }
+                                int completed = completedCount.incrementAndGet();
+                                return ServerSentEvent.<String>builder()
+                                        .event("file_complete")
+                                        .data("{\"index\": " + index + ", \"literatureId\": " + literatureId
+                                                + ", \"completed\": " + completed + ", \"total\": " + total
+                                                + ", \"message\": \"文件处理完成\"}")
+                                        .build();
+                            }).subscribeOn(Schedulers.boundedElastic()))
+                            .onErrorResume(e -> {
+                                int completed = completedCount.incrementAndGet();
+                                int errors = errorCount.incrementAndGet();
+                                return Mono.just(ServerSentEvent.<String>builder()
+                                        .event("file_error")
+                                        .data("{\"index\": " + index + ", \"filename\": \""
+                                                + file.getOriginalFilename() + "\", \"error\": \"" + e.getMessage()
+                                                + "\", \"completed\": " + completed + ", \"total\": " + total + "}")
+                                        .build());
+                            });
+                    return Flux.concat(fileStart, savedEvent, result);
+                });
 
-        // 使用CompletableFuture + 虚拟线程池并发处理每个文件
-        List<CompletableFuture<Void>> futures = request.getFiles().stream()
-                .map(file -> CompletableFuture.runAsync(() -> {
-                    try {
-                        int fileIndex = request.getFiles().indexOf(file);
+        Flux<ServerSentEvent<String>> completion = Flux.just(ServerSentEvent.<String>builder()
+                .event("batch_complete")
+                .data("{\"message\": \"批量处理完成\", \"total\": " + total + ", \"errors\": " + errorCount.get() + "}")
+                .build());
 
-                        // 发送文件开始处理事件
-                        sendSseEvent(sseEmitter, "file_start",
-                                "{\"index\": " + fileIndex + ", \"filename\": \"" + file.getOriginalFilename()
-                                        + "\", \"message\": \"开始处理文件\"}");
-
-                        // 保存文件
-                        String filePath = fileProcessingService.saveFile(file);
-
-                        // 解析文件内容
-                        String fileContent = fileProcessingService.extractFileContent(filePath);
-
-                        // 创建文献记录
-                        Long literatureId = this.createLiterature(file, filePath, fileContent.length());
-
-                        // 发送文件保存成功事件
-                        sendSseEvent(sseEmitter, "file_saved",
-                                "{\"index\": " + fileIndex + ", \"literatureId\": " + literatureId
-                                        + ", \"message\": \"文件保存成功，开始生成阅读指南\"}");
-
-                        // 生成阅读指南（非流式）
-                        String readingGuide = literatureAiService.generateReadingGuide(request.getApiKey(),
-                                fileContent);
-
-                        // 更新阅读指南
-                        if (readingGuide != null && !readingGuide.trim().isEmpty()) {
-                            this.updateReadingGuide(literatureId, readingGuide);
-
-                            // 异步生成分类
-                            literatureAiService.generateClassificationWithVirtualThread(
-                                    request.getApiKey(), readingGuide, literatureId, this);
-                        } else {
-                            this.updateStatus(literatureId, Literature.Status.COMPLETED.getCode());
-                        }
-
-                        // 发送文件完成事件
-                        int completed = completedCount.incrementAndGet();
-                        sendSseEvent(sseEmitter, "file_complete",
-                                "{\"index\": " + fileIndex + ", \"literatureId\": " + literatureId + ", \"completed\": "
-                                        + completed + ", \"total\": " + totalCount.get()
-                                        + ", \"message\": \"文件处理完成\"}");
-
-                        // 检查是否所有文件都处理完成
-                        if (completed == totalCount.get()) {
-                            sendSseEvent(sseEmitter, "batch_complete",
-                                    "{\"message\": \"批量处理完成\", \"total\": " + totalCount.get() + ", \"errors\": "
-                                            + errorCount.get() + "}");
-                            sseEmitter.complete();
-                        }
-
-                    } catch (Exception e) {
-                        log.error("处理文件失败，文件名: {}", file.getOriginalFilename(), e);
-
-                        try {
-                            // 发送文件失败事件
-                            int fileIndex = request.getFiles().indexOf(file);
-                            int completed = completedCount.incrementAndGet();
-                            int errors = errorCount.incrementAndGet();
-
-                            sendSseEvent(sseEmitter, "file_error",
-                                    "{\"index\": " + fileIndex + ", \"filename\": \"" + file.getOriginalFilename()
-                                            + "\", \"error\": \"" + e.getMessage() + "\", \"completed\": " + completed
-                                            + ", \"total\": " + totalCount.get() + "}");
-
-                            // 检查是否所有文件都处理完成（包括失败的）
-                            if (completed == totalCount.get()) {
-                                sendSseEvent(sseEmitter, "batch_complete",
-                                        "{\"message\": \"批量处理完成（部分失败）\", \"total\": " + totalCount.get()
-                                                + ", \"errors\": " + errors + "}");
-                                sseEmitter.complete();
-                            }
-                        } catch (Exception sendException) {
-                            log.error("发送错误事件失败", sendException);
-                        }
-                    }
-                }, virtualThreadExecutor))
-                .collect(Collectors.toList());
-
-        // 设置SSE回调
-        sseEmitter.onCompletion(() -> {
-            log.info("批量导入SSE连接完成");
-        });
-
-        sseEmitter.onError((throwable) -> {
-            log.error("批量导入SSE连接错误", throwable);
-        });
-
-        sseEmitter.onTimeout(() -> {
-            log.warn("批量导入SSE连接超时");
-        });
-
-        return sseEmitter;
-    }
-
-    /**
-     * 安全发送SSE事件
-     */
-    private void sendSseEvent(SseEmitter sseEmitter, String eventName, String data) {
-        try {
-            sseEmitter.send(SseEmitter.event().name(eventName).data(data));
-        } catch (Exception e) {
-            log.warn("发送SSE事件失败: {} - {}", eventName, e.getMessage());
-        }
+        return Flux.concat(start, processing, completion);
     }
 
     /**
