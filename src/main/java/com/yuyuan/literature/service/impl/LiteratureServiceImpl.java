@@ -1,7 +1,5 @@
 package com.yuyuan.literature.service.impl;
 
-import cn.hutool.core.io.FileUtil;
-import cn.hutool.core.util.StrUtil;
 import com.baomidou.mybatisplus.core.metadata.IPage;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
@@ -24,9 +22,12 @@ import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 import jakarta.servlet.http.HttpServletResponse;
 
+import java.io.File;
 import java.io.OutputStream;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Paths;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
@@ -47,7 +48,7 @@ public class LiteratureServiceImpl extends ServiceImpl<LiteratureMapper, Literat
 
     private final FileProcessingService fileProcessingService;
     private final LiteratureAiService literatureAiService;
-    
+
     // 虚拟线程池，用于并发处理文件
     private final Executor virtualThreadExecutor = Executors.newVirtualThreadPerTaskExecutor();
 
@@ -57,7 +58,8 @@ public class LiteratureServiceImpl extends ServiceImpl<LiteratureMapper, Literat
         literature.setOriginalName(file.getOriginalFilename());
         literature.setFilePath(filePath);
         literature.setFileSize(file.getSize());
-        literature.setFileType(FileUtil.extName(file.getOriginalFilename()).toLowerCase());
+        String ext = org.apache.commons.io.FilenameUtils.getExtension(file.getOriginalFilename());
+        literature.setFileType(ext != null ? ext.toLowerCase() : "");
         literature.setContentLength(contentLength);
         literature.setStatus(Literature.Status.PROCESSING.getCode());
 
@@ -75,6 +77,17 @@ public class LiteratureServiceImpl extends ServiceImpl<LiteratureMapper, Literat
 
         this.updateById(literature);
         log.info("更新文献阅读指南成功，ID: {}", id);
+    }
+
+    @Override
+    public void updateReadingGuideAppend(Long id, String chunk) {
+        Literature current = this.getById(id);
+        String original = current != null ? current.getReadingGuide() : null;
+        String combined = (original == null ? "" : original) + (chunk == null ? "" : chunk);
+        Literature update = new Literature();
+        update.setId(id);
+        update.setReadingGuide(combined);
+        this.updateById(update);
     }
 
     @Override
@@ -143,7 +156,7 @@ public class LiteratureServiceImpl extends ServiceImpl<LiteratureMapper, Literat
         vo.setUpdateTime(literature.getUpdateTime());
 
         // 阅读指南摘要（截取前200个字符）
-        if (StrUtil.isNotBlank(literature.getReadingGuide())) {
+        if (literature.getReadingGuide() != null && !literature.getReadingGuide().trim().isEmpty()) {
             String summary = literature.getReadingGuide().length() > 200
                     ? literature.getReadingGuide().substring(0, 200) + "..."
                     : literature.getReadingGuide();
@@ -174,7 +187,7 @@ public class LiteratureServiceImpl extends ServiceImpl<LiteratureMapper, Literat
         }
 
         // 检查文件是否存在
-        if (StrUtil.isBlank(literature.getFilePath())) {
+        if (literature.getFilePath() == null || literature.getFilePath().trim().isEmpty()) {
             throw new BusinessException(ResultCode.FILE_NOT_EXIST, "文件路径为空");
         }
 
@@ -186,10 +199,10 @@ public class LiteratureServiceImpl extends ServiceImpl<LiteratureMapper, Literat
         if (filePath.startsWith("./") || !filePath.startsWith("/")) {
             // 获取项目根目录
             String projectRoot = System.getProperty("user.dir");
-            file = FileUtil.file(projectRoot, filePath);
+            file = Paths.get(projectRoot, filePath).normalize().toFile();
         } else {
             // 绝对路径直接使用
-            file = FileUtil.file(filePath);
+            file = new File(filePath);
         }
 
         if (!file.exists()) {
@@ -210,7 +223,7 @@ public class LiteratureServiceImpl extends ServiceImpl<LiteratureMapper, Literat
 
             // 下载文件
             try (OutputStream os = response.getOutputStream()) {
-                FileUtil.writeToStream(file, os);
+                Files.copy(file.toPath(), os);
                 os.flush();
             }
 
@@ -234,7 +247,7 @@ public class LiteratureServiceImpl extends ServiceImpl<LiteratureMapper, Literat
 
         // 验证API Key
         literatureAiService.validateApiKey(request.getApiKey());
-        
+
         // 发送批量开始事件
         sendSseEvent(sseEmitter, "batch_start", "{\"total\": " + totalCount.get() + ", \"message\": \"开始批量处理\"}");
 
@@ -243,66 +256,75 @@ public class LiteratureServiceImpl extends ServiceImpl<LiteratureMapper, Literat
                 .map(file -> CompletableFuture.runAsync(() -> {
                     try {
                         int fileIndex = request.getFiles().indexOf(file);
-                        
+
                         // 发送文件开始处理事件
-                        sendSseEvent(sseEmitter, "file_start", 
-                                "{\"index\": " + fileIndex + ", \"filename\": \"" + file.getOriginalFilename() + "\", \"message\": \"开始处理文件\"}");
-                        
+                        sendSseEvent(sseEmitter, "file_start",
+                                "{\"index\": " + fileIndex + ", \"filename\": \"" + file.getOriginalFilename()
+                                        + "\", \"message\": \"开始处理文件\"}");
+
                         // 保存文件
                         String filePath = fileProcessingService.saveFile(file);
-                        
+
                         // 解析文件内容
                         String fileContent = fileProcessingService.extractFileContent(filePath);
-                        
+
                         // 创建文献记录
                         Long literatureId = this.createLiterature(file, filePath, fileContent.length());
-                        
+
                         // 发送文件保存成功事件
-                        sendSseEvent(sseEmitter, "file_saved", 
-                                "{\"index\": " + fileIndex + ", \"literatureId\": " + literatureId + ", \"message\": \"文件保存成功，开始生成阅读指南\"}");
-                        
+                        sendSseEvent(sseEmitter, "file_saved",
+                                "{\"index\": " + fileIndex + ", \"literatureId\": " + literatureId
+                                        + ", \"message\": \"文件保存成功，开始生成阅读指南\"}");
+
                         // 生成阅读指南（非流式）
-                        String readingGuide = literatureAiService.generateReadingGuide(request.getApiKey(), fileContent);
-                        
+                        String readingGuide = literatureAiService.generateReadingGuide(request.getApiKey(),
+                                fileContent);
+
                         // 更新阅读指南
-                        if (StrUtil.isNotBlank(readingGuide)) {
+                        if (readingGuide != null && !readingGuide.trim().isEmpty()) {
                             this.updateReadingGuide(literatureId, readingGuide);
-                            
+
                             // 异步生成分类
                             literatureAiService.generateClassificationWithVirtualThread(
                                     request.getApiKey(), readingGuide, literatureId, this);
                         } else {
                             this.updateStatus(literatureId, Literature.Status.COMPLETED.getCode());
                         }
-                        
+
                         // 发送文件完成事件
                         int completed = completedCount.incrementAndGet();
-                        sendSseEvent(sseEmitter, "file_complete", 
-                                "{\"index\": " + fileIndex + ", \"literatureId\": " + literatureId + ", \"completed\": " + completed + ", \"total\": " + totalCount.get() + ", \"message\": \"文件处理完成\"}");
-                        
+                        sendSseEvent(sseEmitter, "file_complete",
+                                "{\"index\": " + fileIndex + ", \"literatureId\": " + literatureId + ", \"completed\": "
+                                        + completed + ", \"total\": " + totalCount.get()
+                                        + ", \"message\": \"文件处理完成\"}");
+
                         // 检查是否所有文件都处理完成
                         if (completed == totalCount.get()) {
-                            sendSseEvent(sseEmitter, "batch_complete", 
-                                    "{\"message\": \"批量处理完成\", \"total\": " + totalCount.get() + ", \"errors\": " + errorCount.get() + "}");
+                            sendSseEvent(sseEmitter, "batch_complete",
+                                    "{\"message\": \"批量处理完成\", \"total\": " + totalCount.get() + ", \"errors\": "
+                                            + errorCount.get() + "}");
                             sseEmitter.complete();
                         }
-                        
+
                     } catch (Exception e) {
                         log.error("处理文件失败，文件名: {}", file.getOriginalFilename(), e);
-                        
+
                         try {
                             // 发送文件失败事件
                             int fileIndex = request.getFiles().indexOf(file);
                             int completed = completedCount.incrementAndGet();
                             int errors = errorCount.incrementAndGet();
-                            
-                            sendSseEvent(sseEmitter, "file_error", 
-                                    "{\"index\": " + fileIndex + ", \"filename\": \"" + file.getOriginalFilename() + "\", \"error\": \"" + e.getMessage() + "\", \"completed\": " + completed + ", \"total\": " + totalCount.get() + "}");
-                            
+
+                            sendSseEvent(sseEmitter, "file_error",
+                                    "{\"index\": " + fileIndex + ", \"filename\": \"" + file.getOriginalFilename()
+                                            + "\", \"error\": \"" + e.getMessage() + "\", \"completed\": " + completed
+                                            + ", \"total\": " + totalCount.get() + "}");
+
                             // 检查是否所有文件都处理完成（包括失败的）
                             if (completed == totalCount.get()) {
-                                sendSseEvent(sseEmitter, "batch_complete", 
-                                        "{\"message\": \"批量处理完成（部分失败）\", \"total\": " + totalCount.get() + ", \"errors\": " + errors + "}");
+                                sendSseEvent(sseEmitter, "batch_complete",
+                                        "{\"message\": \"批量处理完成（部分失败）\", \"total\": " + totalCount.get()
+                                                + ", \"errors\": " + errors + "}");
                                 sseEmitter.complete();
                             }
                         } catch (Exception sendException) {
@@ -311,20 +333,20 @@ public class LiteratureServiceImpl extends ServiceImpl<LiteratureMapper, Literat
                     }
                 }, virtualThreadExecutor))
                 .collect(Collectors.toList());
-        
+
         // 设置SSE回调
         sseEmitter.onCompletion(() -> {
             log.info("批量导入SSE连接完成");
         });
-        
+
         sseEmitter.onError((throwable) -> {
             log.error("批量导入SSE连接错误", throwable);
         });
-        
+
         sseEmitter.onTimeout(() -> {
             log.warn("批量导入SSE连接超时");
         });
-        
+
         return sseEmitter;
     }
 

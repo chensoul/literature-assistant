@@ -40,3 +40,5 @@ build/
 data/**
 logs/**
 uploads/**
+
+!/frontend/node_modules/

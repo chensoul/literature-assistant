@@ -18,7 +18,7 @@ public class LiteratureAnalysisRequest {
     /**
      * API Key
      */
-    @Schema(description = "Kimi AI API Key", required = true)
+    @Schema(description = "Ali API Key", required = true)
     @NotBlank(message = "API Key 不能为空")
     private String apiKey;
 }

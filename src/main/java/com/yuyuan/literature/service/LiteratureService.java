@@ -85,4 +85,12 @@ public interface LiteratureService extends IService<Literature> {
      * @return SSE发射器
      */
     SseEmitter batchImportLiterature(BatchLiteratureImportRequest request);
+
+    /**
+     * 追加更新阅读指南内容（流式写入）
+     *
+     * @param id 文献ID
+     * @param chunk 内容片段
+     */
+    void updateReadingGuideAppend(Long id, String chunk);
 }
